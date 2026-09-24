@@ -30,7 +30,11 @@ def parse_headers(header_text):
 
 def read_http_request(client_socket, buffer):
     while b"\r\n\r\n" not in buffer:
-        chunk = client_socket.recv(4096)
+        try:
+            chunk = client_socket.recv(4096)
+        except socket.timeout:
+            return None, buffer
+            
         if not chunk:
             return None, buffer
         buffer.extend(chunk)
@@ -43,16 +47,19 @@ def read_http_request(client_socket, buffer):
     method, path, version, headers = parse_headers(header_text)
     
     if method is None:
-        return {"malformed": True}, buffer
+        return {"malformed": True, "headers": headers}, buffer
 
     body = b""
     try:
         content_length = int(headers.get("content-length", 0))
     except ValueError:
-        return {"malformed": True}, buffer
+        return {"malformed": True, "headers": headers}, buffer
 
     while len(buffer) < content_length:
-        chunk = client_socket.recv(4096)
+        try:
+            chunk = client_socket.recv(4096)
+        except socket.timeout:
+            break
         if not chunk:
             break
         buffer.extend(chunk)
@@ -133,8 +140,25 @@ def process_request(request):
     return 200, "OK", result_str
 
 
+def build_response(status_code, reason, body, close_connection=False):
+    body_bytes = body.encode('utf-8')
+    connection_val = "close" if close_connection else "keep-alive"
+    
+    headers = [
+        f"HTTP/1.1 {status_code} {reason}",
+        f"Content-Type: text/plain",
+        f"Content-Length: {len(body_bytes)}",
+        f"Connection: {connection_val}",
+        "",
+        ""
+    ]
+    header_bytes = "\r\n".join(headers).encode('iso-8859-1')
+    return header_bytes + body_bytes
+
+
 def handle_client(client_socket, client_address):
-    print(f"Connected: {client_address}")
+    # Idle timeout (5s) to defend against hanging connections
+    client_socket.settimeout(5.0)
     buffer = bytearray()
     
     try:
@@ -144,15 +168,25 @@ def handle_client(client_socket, client_address):
                 break
 
             status_code, reason, body = process_request(request)
-            print(f"[{client_address}] {request.get('method')} {request.get('path')} -> {status_code} {body}")
+            
+            # Honour client's Connection: close header
+            conn_header = request.get("headers", {}).get("connection", "").lower()
+            should_close = (conn_header == "close") or request.get("malformed", False)
 
+            response = build_response(status_code, reason, body, close_connection=should_close)
+            client_socket.sendall(response)
+
+            if should_close:
+                break
+
+    except socket.timeout:
+        pass
     except ConnectionResetError:
         pass
     except Exception as e:
         print(f"Error handling {client_address}: {e}")
     finally:
         client_socket.close()
-        print(f"Closed: {client_address}")
 
 
 def run_server(host=HOST, port=PORT):
