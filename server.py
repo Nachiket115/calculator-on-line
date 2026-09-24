@@ -4,6 +4,8 @@ import sys
 HOST = '127.0.0.1'
 PORT = 8080
 
+VALID_ROUTES = {'/add', '/sub', '/mul', '/div'}
+
 
 def parse_headers(header_text):
     lines = header_text.split("\r\n")
@@ -35,7 +37,6 @@ def read_http_request(client_socket, buffer):
 
     header_end = buffer.find(b"\r\n\r\n")
     header_bytes = buffer[:header_end]
-    # Remove headers and the \r\n\r\n delimiter from the buffer
     del buffer[:header_end + 4]
 
     header_text = header_bytes.decode('iso-8859-1')
@@ -44,9 +45,12 @@ def read_http_request(client_socket, buffer):
     if method is None:
         return {"malformed": True}, buffer
 
-    # Read body if Content-Length is present
     body = b""
-    content_length = int(headers.get("content-length", 0))
+    try:
+        content_length = int(headers.get("content-length", 0))
+    except ValueError:
+        return {"malformed": True}, buffer
+
     while len(buffer) < content_length:
         chunk = client_socket.recv(4096)
         if not chunk:
@@ -68,6 +72,67 @@ def read_http_request(client_socket, buffer):
     return request, buffer
 
 
+def parse_query_params(query_string):
+    params = {}
+    if not query_string:
+        return params
+    for part in query_string.split("&"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            params[k] = v
+    return params
+
+
+def process_request(request):
+    if request.get("malformed"):
+        return 400, "Bad Request", "400 Bad Request"
+
+    # HTTP/1.1 requires a Host header
+    if "host" not in request["headers"]:
+        return 400, "Bad Request", "400 Bad Request"
+
+    raw_path = request["path"]
+    if "?" in raw_path:
+        endpoint, query_string = raw_path.split("?", 1)
+    else:
+        endpoint, query_string = raw_path, ""
+
+    # Check if route exists
+    if endpoint not in VALID_ROUTES:
+        return 404, "Not Found", "404 Not Found"
+
+    # Only GET is allowed for calculator routes
+    if request["method"] != "GET":
+        return 405, "Method Not Allowed", "405 Method Not Allowed"
+
+    params = parse_query_params(query_string)
+    if "a" not in params or "b" not in params:
+        return 400, "Bad Request", "400 Bad Request"
+
+    try:
+        a = float(params["a"])
+        b = float(params["b"])
+    except ValueError:
+        return 400, "Bad Request", "400 Bad Request"
+
+    if endpoint == "/add":
+        res = a + b
+    elif endpoint == "/sub":
+        res = a - b
+    elif endpoint == "/mul":
+        res = a * b
+    elif endpoint == "/div":
+        if b == 0:
+            return 400, "Bad Request", "400 Bad Request"
+        res = a / b
+    else:
+        return 404, "Not Found", "404 Not Found"
+
+    # Format integers cleanly without trailing .0
+    result_str = str(int(res)) if res.is_integer() else str(res)
+    return 200, "OK", result_str
+
+
 def handle_client(client_socket, client_address):
     print(f"Connected: {client_address}")
     buffer = bytearray()
@@ -76,10 +141,10 @@ def handle_client(client_socket, client_address):
         while True:
             request, buffer = read_http_request(client_socket, buffer)
             if request is None:
-                # Client closed the connection
                 break
 
-            print(f"[{client_address}] {request.get('method')} {request.get('path')}")
+            status_code, reason, body = process_request(request)
+            print(f"[{client_address}] {request.get('method')} {request.get('path')} -> {status_code} {body}")
 
     except ConnectionResetError:
         pass
